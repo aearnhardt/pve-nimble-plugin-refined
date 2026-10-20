@@ -1,0 +1,200 @@
+# HPE Nimble Storage REST API Reference (in-repo extract)
+
+This file is an in-repo extract of the **HPE Nimble Storage REST API Reference Version 5.1.1.0** for AI and contributor context. Full docs: [REST API 5.1.1.0](https://support.hpe.com/docs/display/public/nmtp352en_us/wzk1480348939804.html). The same v1 contract (port 5392, `{ "data": ... }` envelope) is what **HPE Alletra 5000 and Alletra 6000** expose; they run NimbleOS. A later public reference, [REST API 5.3.2.0](https://support.hpe.com/docs/display/public/nmtp350en_us/index.html), still documents the operations this plugin calls (tokens, volume create/clone, restore, snapshots, QoS, folders).
+
+**Base URL:** `https://<array_mgmt_ip>:5392/v1/`  
+**Auth:** POST `tokens` with `data.username` and `data.password` → response `data.session_token`; use `X-Auth-Token` on subsequent requests.
+
+**Related (same REST API, different language):** HPE’s [Nimble Python SDK](https://github.com/hpe-storage/nimble-python-sdk) ([documentation](https://hpe-storage.github.io/nimble-python-sdk/)) maps object sets (volumes, snapshots, initiator_groups, subnets, tokens, etc.) to Python clients. This repo does not use that SDK; it is a useful reference if you extract or mirror the API as a Perl module—compare paths, payloads, and `data` envelopes against this file and `docs/API_VALIDATION.md`.
+
+---
+
+## 1. Request/response envelope (data wrapper)
+
+All request bodies and single-object responses use a **`data`** wrapper:
+
+- **Request:** `{ "data": { ...payload... } }`
+- **Response:** `{ "data": { ...object... } }` or `{ "data": [ ...array... ] }`
+
+Example (tokens Create):
+
+```json
+// Request
+{ "data": { "username": "admin", "password": "admin" } }
+
+// Response
+{ "data": { "session_token": "1c1cfbac...", "id": "19000000...", "username": "admin", "creation_time": 1426802065, ... } }
+```
+
+---
+
+## 2. Object sets index (REST API 5.1.1.0)
+
+| Object set | Description | RESTful ops | RPC actions |
+|------------|-------------|-------------|-------------|
+| **access_control_records** | Records for access to volumes/snapshots | create, read, delete | |
+| **initiator_groups** | Groups of initiators for ACL | create, read, update, delete | suggest_lun, validate_lun |
+| **initiators** | Initiators in initiator groups | create, read, delete | |
+| **pools** | Storage pools | create, read, update, delete | merge |
+| **snapshots** | Snapshots for a volume | create, read, update, delete | bulk_create |
+| **tokens** | User session tokens | create, read, delete | report_user_details |
+| **volumes** | Volumes (LUNs) | create, read, update, delete | abort_move, bulk_move, bulk_set_dedupe, get_allocated_bitmap, get_unshared_bitmap, move, **restore** |
+
+Other sets in full docs: active_directory_memberships, alarms, application_servers, application_categories, arrays, audit_log, chap_users, disks, shelves, master_key, events, fibre_channel_*, folders, groups, jobs, network_*, performance_policies, protection_*, protocol_endpoints, replication_partners, snapshot_collections, software_versions, space_domains, subnets, user_groups, users, versions, volume_collections.
+
+---
+
+## 3. tokens
+
+**Create — POST v1/tokens**
+
+- **Request (data):** `username` (mandatory), `password`, optional `app_name`, `source_ip`.
+- **Response (data):** `id`, `session_token`, `username`, `app_name`, `source_ip`, `creation_time`, `last_modified`.
+- **JSON request example:** `{ "data": { "username": "admin", "password": "admin" } }`
+- **Normal response:** 201.
+
+---
+
+## 4. initiator_groups
+
+**Create — POST v1/initiator_groups**
+
+- **Request (data):** `name` (mandatory), `access_protocol` (mandatory; 'iscsi' or 'fc'), optional `description`, `host_type`, `target_subnets`, **`iscsi_initiators`**, **`fc_initiators`**, `app_uuid`.
+- **iscsi_initiators:** Array of `{ "label": "...", "iqn": "...", "ip_address": "..." }`. Either `iqn` or `ip_address` required with `label`.
+- **fc_initiators:** Array of `{ "wwpn": "...", "alias": "..." }`; `wwpn` required.
+- **Response (data):** `id`, `name`, `full_name`, `search_name`, `access_protocol`, `iscsi_initiators`, `fc_initiators`, `creation_time`, `last_modified`, etc.
+- **Normal response:** 201.
+
+---
+
+## 5. initiators
+
+**Create — POST v1/initiators**
+
+- **Request (data):** `access_protocol` (mandatory), `initiator_group_id` (mandatory), optional `label`, `iqn`, `ip_address` (iSCSI), `alias`, `wwpn` (FC).
+- **Response (data):** `id`, `access_protocol`, `initiator_group_id`, `initiator_group_name`, `label`, `iqn`, `ip_address`, etc.
+- **Normal response:** 201, 202.
+
+---
+
+## 6. volumes
+
+**Create — POST v1/volumes**
+
+- **Request (data):** `name` (mandatory), `size` (mandatory for create, MB), optional `description`, `perfpolicy_id`, `reserve`, `warn_level`, `limit`, `snap_*`, `online`, `pool_id`, `read_only`, `block_size`, `clone`, `base_snap_id`, `agent_type`, `cache_pinned`, `encryption_cipher`, `app_uuid`, `folder_id`, `metadata`, etc. Plugin uses `pool_name` (accepted in practice); API doc lists `pool_id`.
+- **Response (data):** `id`, `name`, `full_name`, `size`, `serial_number`, **`target_name`** (iSCSI IQN or FC WWNN for the volume target), `pool_name`, `pool_id`, `creation_time`, `last_modified`, etc.
+- **Normal response:** 201, 202.
+
+**Restore — POST v1/volumes/id/actions/restore**
+
+- **Request (data):** `id` (mandatory; volume to restore), `base_snap_id` (mandatory).
+- **Normal response:** 200.
+- **Prerequisite:** The volume must be **offline** on the array (`online` false). Otherwise the array may return **409** with code **`SM_vol_not_offline_on_restore`**. PUT **`online=false`** can return **409** / **`SM_vol_has_connections`** when initiators are connected **to this volume or to another volume in the same Nimble cgroup** (error text may cite a sibling **`vol=`**). Before **`nimble_volume_ensure_offline`**, the plugin runs **`nimble_volume_prepare_restore_disconnect`** for the target; **`nimble_volume_ensure_offline`** retries with **`force: true`** if the normal PUT hits connection/conflict **409**. Then **`nimble_volume_ensure_online`** after restore; the next **`activate_volume`** re-posts ACL and maps again.
+
+**Read — GET v1/volumes**, GET v1/volumes?name=...  
+**Update — PUT v1/volumes/id** — e.g. `size`, `name`, **`online`**, optional **`force`** (HPE doc: *forcibly offline*, reduce size, or change read-only). **`nimble_volume_ensure_offline`** uses **`{ online: false }`**, then on **409** / **`SM_vol_has_connections`** (often another LUN in the same Nimble **cgroup** still connected) retries with **`{ online: false, force: true }`**.  
+**Delete — DELETE v1/volumes/id** — **`nimble_remove_volume`** runs **`nimble_volume_prepare_restore_disconnect`** (unmap, iSCSI logout, all ACRs), purges snapshots (multi-round), **`nimble_volume_ensure_offline`**, purges snapshots again, then **DELETE**. **`free_image`** (e.g. move-disk “delete source”) uses this path. **409** / **`SM_eperm`** often meant lingering snapshots or initiators; see **`docs/API_VALIDATION.md`** (volume delete). **`nimble_volume_offline_then_delete_best_effort`** only offlines then **DELETE** (orphan cleanup).
+
+---
+
+## 7. access_control_records
+
+**Create — POST v1/access_control_records**
+
+- **Request (data):** `vol_id` (required for volume/snapshot), `initiator_group_id`, optional `apply_to` ('volume'|'snapshot'|'both'|'pe'|'vvol_*'), `chap_user_id`, `lun`, `pe_id`, `snap_id`, `pe_ids`.
+- **Response (data):** `id`, `apply_to`, `vol_id`, `vol_name`, `initiator_group_id`, `initiator_group_name`, `lun`, `creation_time`, etc.
+- **Normal response:** 201, 202.
+
+---
+
+## 8. snapshots
+
+**Create — POST v1/snapshots**
+
+- **Request (data):** `name` (mandatory), `vol_id` (mandatory), optional `description`, `online`, `writable`, `app_uuid`, `metadata`, `agent_type`.
+- **Response (data):** `id`, `name`, `vol_id`, `vol_name`, `size`, `serial_number`, `creation_time`, `last_modified`, etc.
+- **Normal response:** 201, 202.
+
+**Read — GET v1/snapshots**, GET v1/snapshots?name=..., GET v1/snapshots?vol_id=..., optional detail when list rows omit times (plugin **`nimble_hydrate_snapshot_detail`** merges in order): **GET v1/snapshots/:id**, **GET v1/snapshots?id=**, then **GET v1/volumes/:id** (HPE: snapshots are volumes; volume read often carries **`creation_time`**), then **GET v1/snapshot_collections/:id** (or **`snapshot_collections?id=`**) using the snapshot’s **`snap_collection_id`** for scheduled collection **`creation_time`**.  
+**Delete — DELETE v1/snapshots/id**
+
+---
+
+## 9. pools
+
+**Read — GET v1/pools**
+
+- **Response (data):** Array of pool objects. Key fields: `id`, `name`, **`capacity`** (bytes), **`usage`** (bytes; NsBytes), **`usage_valid`**, `free_space`, `savings_*`, `snap_count`, `vol_count`, etc.
+- **List vs detail:** List responses may omit or zero **`capacity`** (summary rows). Use **GET v1/pools/:id** for full fields when **`capacity`** / **`free_space`** are missing; the plugin hydrates each pool in **`status()`** when needed. If pools still yield no totals, **`status()`** falls back to **GET v1/arrays** (per-array **`usable_capacity_bytes`**, **`available_bytes`**, **`usage`**, filtered against configured **`pool_name`** and the pool rows used for the primary sum—see **`nimble_array_matches_status_pools`** in the plugin).
+- **Derived capacity caveat:** When **`capacity`** is derived as **`free_space + usage`** and **`usage`** is only available as **`uncompressed_usage`** (logical) while **`free_space`** is physical, the sum can **overstate** physical total versus arrays that report **`compressed_usage`**. Prefer API **`capacity`** or **`compressed_usage`** when present.
+- **Normal response:** 200.
+
+---
+
+## 9.1 Networking (management and iSCSI discovery IPs)
+
+The plugin uses **subnets** (and optional **network_interfaces** fallback) to build iSCSI discovery portal lists. **network_interfaces** is also useful for displaying management vs data IPs.
+
+**GET v1/network_interfaces** and **GET v1/network_interfaces/:id**
+
+- **List response (data):** May be **summary rows** (`id`, `name`, …) without **`ip_list`**; use **GET v1/network_interfaces/:id** for full fields.
+- **Key fields:** `id`, `name`, **`ip_list`** (list of IPs on this interface), **`nic_type`** (interface role/type), `controller_id`, `controller_name`, `link_status`, `link_speed`, `mac`, `mtu`, `slot`, `port`, `array_id`, `array_name_or_serial`.
+- Use `nic_type` and `ip_list` to identify management vs data/iSCSI interfaces (exact `nic_type` values are array/OS-dependent; see Nimble CLI `ip --list` for Type: management, discovery, data, support).
+- **Normal response:** 200.
+
+**GET v1/subnets** and **GET v1/subnets/:id**
+
+- **List response (data):** May be **summary rows** (`id`, `name` only); the plugin always merges **GET v1/subnets/:id** for each listed subnet so **`discovery_ip`** and **`type`** come from the documented object shape.
+- **Key fields:** `id`, `name`, **`type`** (e.g. `'mgmt'`, `'data'`, `'mgmt,data'`), **`discovery_ip`** (address used for iSCSI discovery on this subnet), **`allow_iscsi`**, `network`, `netmask`, `vlan_id`, `mtu`, `failover`, `netzone_type`, `creation_time`, `last_modified`.
+- For **iSCSI discovery IPs:** Prefer each subnet’s **`discovery_ip`** where **`type` contains `data`** for `iscsiadm -m discovery -t sendtargets -p <discovery_ip>`. If none match, use any subnet with a non-empty **`discovery_ip`**.
+- For **management:** The management IP is the one you already use for the API (the `nimble_address` in storage config). To list it from the API, use subnets with `type` containing `'mgmt'` (and use the subnet’s `discovery_ip` or similar, if documented) or use **network_interfaces** and pick the interface whose `nic_type` indicates management.
+- **Normal response:** 200.
+
+**Summary for “show management and discovery IPs”**
+
+| Goal | API call | Use |
+|------|----------|-----|
+| iSCSI discovery IPs | GET v1/subnets, GET v1/subnets/:id | Plugin merges **GET subnets/:id** for every subnet row, then prefers `type` containing `data` + `discovery_ip`. |
+| All interface IPs (mgmt + data) | GET v1/network_interfaces | Use `ip_list` and `nic_type` per interface to show management vs discovery/data. |
+| Management IP | Already known | It’s the `address` you use for the API. Optionally confirm via subnets (type mgmt) or network_interfaces. |
+
+---
+
+**Plugin use:** For **`activate_storage`** (unless **`nimble_auto_iscsi_discovery`** is **`no`**/**`0`**) and for **`map_volume`**, discovery portals are built from **GET v1/subnets**, then **GET v1/subnets/:id** for **each** subnet (merged into the list row), then **`discovery_ip`** values are collected—first subnets whose **`type` contains `data`**, then any subnet with **`discovery_ip`**. If still empty: **GET network_interfaces** (+ **:id** when needed), optional **`nimble_iscsi_discovery_ips`** from storage config, and finally IPs parsed from existing **tcp** `iscsiadm` sessions on the host (last resort, appended after API-derived portals).
+
+## 10. Plugin-relevant endpoints summary
+
+| What | Method | Path | Body (inside `data`) |
+|------|--------|------|----------------------|
+| Login | POST | v1/tokens | username, password |
+| List initiator groups | GET | initiator_groups?name=... | — |
+| Create initiator group | POST | initiator_groups | name, access_protocol, iscsi_initiators |
+| List volumes | GET | volumes or volumes?name=... | — |
+| Create volume | POST | volumes | name, size, optional pool_name, folder_id (from `nimble_folder` lookup), limit_iops / limit_mbps (from `nimble_limit_iops` / `nimble_limit_mbps`; iops >= 256, mbps >= 1, -1 = unlimited/omitted) |
+| Update volume | PUT | volumes/:id | size, name, or volcoll_id (to add/remove from volume collection) |
+| Delete volume | DELETE | volumes/:id | — |
+| List volume collections | GET | volume_collections or volume_collections?name=... | — |
+| List folders | GET | folders or folders?name=... | — |
+| Restore volume | POST | volumes/:id/actions/restore | id, base_snap_id |
+| Create ACL | POST | access_control_records | vol_id, initiator_group_id |
+| Create snapshot | POST | snapshots | vol_id, name |
+| List snapshots | GET | snapshots?name=... | — |
+| Delete snapshot | DELETE | snapshots/:id | — |
+| List pools | GET | pools | — |
+| Pool detail (capacity when list is summary) | GET | pools/:id | — |
+| List arrays (status capacity fallback) | GET | arrays | — |
+| Get iSCSI discovery IPs (auto_iscsi_discovery) | GET | subnets, subnets/:id | — |
+
+---
+
+## 11. Official doc links (5.1.1.0)
+
+- [REST API (object sets index)](https://support.hpe.com/docs/display/public/nmtp352en_us/wzk1480348939804.html)
+- [Perl code sample (tokens, volumes)](https://support.hpe.com/docs/display/public/nmtp352en_us/htr1449782650567.html)
+- [tokens](https://support.hpe.com/docs/display/public/nmtp352en_us/hyv1480349057572.html) → [Create](https://support.hpe.com/docs/display/public/nmtp352en_us/umf1480349057761.html)
+- [initiator_groups](https://support.hpe.com/docs/display/public/nmtp352en_us/jom14803490011631.html) → [Create](https://support.hpe.com/docs/display/public/nmtp352en_us/wir14803490013351.html)
+- [initiators](https://support.hpe.com/docs/display/public/nmtp352en_us/irx1480349008822.html) → [Create](https://support.hpe.com/docs/display/public/nmtp352en_us/zws1480349009009.html)
+- [volumes](https://support.hpe.com/docs/display/public/nmtp352en_us/wex1480349067913.html) → [Create](https://support.hpe.com/docs/display/public/nmtp352en_us/dyz1480349073106.html), [Restore](https://support.hpe.com/docs/display/public/nmtp352en_us/dyi1480349077467.html)
+- [access_control_records](https://support.hpe.com/docs/display/public/nmtp352en_us/ktk1480348940664.html) → [Create](https://support.hpe.com/docs/display/public/nmtp352en_us/tkf1480348940945.html)
+- [snapshots](https://support.hpe.com/docs/display/public/nmtp352en_us/clb1480349051490.html) → [Create](https://support.hpe.com/docs/display/public/nmtp352en_us/qfv1480349052600.html)
+- [pools](https://support.hpe.com/docs/display/public/nmtp352en_us/zty1480349029606.html) → [Read](https://support.hpe.com/docs/display/public/nmtp352en_us/ahk1480349034094.html)
