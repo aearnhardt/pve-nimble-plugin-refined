@@ -1,5 +1,7 @@
 # Proxmox VE Plugin for HPE Nimble Storage (iSCSI)
 
+**Version: v0.0.25a** — a fork of the upstream [pve-nimble-plugin](https://github.com/brngates98/pve-nimble-plugin) v0.0.25 with installer and deployment changes (see [Changes in v0.0.25a](#changes-in-v0025a)). The storage plugin code itself (`NimbleStoragePlugin.pm`) and the GUI panel (`NimbleEdit.js`) are unchanged from v0.0.25.
+
 Integrates HPE Nimble Storage with Proxmox VE over iSCSI. Manages volumes via the NimbleOS REST API and presents them as **QEMU VM disks** and **LXC container root** volumes (`rootdir`, raw block) with optional multipath.
 
 **HPE Alletra 5000 and Alletra 6000** are supported with the same configuration. Those arrays run NimbleOS and expose the same REST API (`https://<array>:5392/v1/`) and iSCSI model, so the storage type stays `nimble`.
@@ -15,6 +17,20 @@ Array-created snapshots sync into the Proxmox VM snapshot tree as **`nimble*`** 
 ![Proxmox VM snapshot tree with nimble* array-synced entries](https://raw.githubusercontent.com/brngates98/pve-nimble-plugin/main/docs/images/pve-vm-snapshots-nimble-tree.png)
 
 **Screenshots:** More UI examples (VM Disks, snapshot dialogs, live migration, HPE Nimble volume list) are in **[docs/images/](docs/images/)** — see the index **[docs/images/README.md](docs/images/README.md)**. All figures are embedded in the **[step-by-step setup guide](docs/00-SETUP-FULLY-PROTECTED-STORAGE.md)**.
+
+## Changes in v0.0.25a
+
+Installer and deployment only; none of these touch the storage plugin or GUI code.
+
+- **Installer menu** — `scripts/install-pve-nimble-plugin.sh` shows an interactive menu when run on a terminal with no options: install/upgrade from GitHub, install a specific release, install from the local copy, install on all cluster nodes (GitHub or local copy), show status, uninstall.
+- **Local-copy install** — `--local` / `--local-dir DIR` (or menu option 3/5) installs `NimbleStoragePlugin.pm` and the GUI straight from a repo checkout. No APT repo is added and nothing is downloaded. Cluster installs copy the files to each node over SSH.
+- **Local copy is the default** — run from a checkout, both scripts use the local files. GitHub is used only when asked for (`--github`, `--version`, or the GitHub menu options), or when there is no local copy (`curl | bash`).
+- **`--status` and `--uninstall`** — report plugin, GUI and service state; remove the plugin, GUI file, script tag and apt hook (leaves `storage.cfg` untouched).
+- **GUI installed by every path** — `scripts/deploy-nimble-plugin-pm.sh` previously installed only the `.pm` file. It now also installs `NimbleEdit.js` and adds its tag to `index.html.tpl` on this node and the remote nodes. The installer warns at the end if the GUI file or tag is missing.
+- **`--github` on the deploy script** — downloads the files from GitHub instead of using the checkout.
+- **HPE banner** — the installer prints an HPE logo banner on start.
+
+Known gaps: the GitHub URLs in both scripts still point at the upstream `brngates98` repo, and the new installer paths have not yet been run on a live PVE node.
 
 ## Requirements
 
@@ -46,6 +62,15 @@ curl -fsSL https://raw.githubusercontent.com/brngates98/pve-nimble-plugin/main/s
 ```
 
 Other options: `--yes` (non-interactive), `--version X.Y.Z` (pin a release), `--codename SUITE` (default `bookworm`).
+
+**From a local checkout** — run the script from the repo; it installs the local files (plugin + GUI) with no APT repo and no download. Run with no options for the interactive menu:
+
+```bash
+sudo ./scripts/install-pve-nimble-plugin.sh              # menu
+sudo ./scripts/install-pve-nimble-plugin.sh --local --yes # local copy, no prompts
+sudo ./scripts/install-pve-nimble-plugin.sh --status      # plugin / GUI / services
+sudo ./scripts/install-pve-nimble-plugin.sh --uninstall
+```
 
 **Manual APT**
 

@@ -26,7 +26,7 @@ export no_proxy
 ##########################################################
 # defines
 ##########################################################
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 readonly OS_RELEASE_FILE=/etc/os-release
 readonly SOURCES_LIST=/etc/apt/sources.list.d/pve-nimble-plugin.list
 # Same set/order as pve-purestorage-plugin debian/postinst (no pve-cluster); see debian/postinst in this repo.
