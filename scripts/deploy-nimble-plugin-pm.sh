@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# NimbleStoragePlugin.pm: curl/wget -> install + restart here, then scp to pve001 and pve003 and same there.
+# NimbleStoragePlugin.pm + GUI (NimbleEdit.js and its index.html.tpl tag): install + restart here,
+# then scp to pve001 and pve003 and same there.
 # Intended: run on pve002 with passwordless root SSH to pve001 / pve003.
 #
-#   sudo ./deploy-nimble-plugin-pm.sh
+#   sudo ./deploy-nimble-plugin-pm.sh            # files from this repo checkout (default)
+#   sudo ./deploy-nimble-plugin-pm.sh --github   # download files from GitHub instead
 #
 set -euo pipefail
+
+GITHUB=0
+case "${1-}" in
+  --github) GITHUB=1 ;;
+  "") ;;
+  *) echo "Usage: $0 [--github]" >&2; exit 1 ;;
+esac
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 readonly TARGET='/usr/share/perl5/PVE/Storage/Custom/NimbleStoragePlugin.pm'
 readonly DEFAULT_URL='https://raw.githubusercontent.com/brngates98/pve-nimble-plugin/main/NimbleStoragePlugin.pm'
@@ -52,15 +62,25 @@ install_from_tmp() {
 [[ $EUID -eq 0 ]] || { echo "Run as root (sudo)." >&2; exit 1; }
 command -v pveversion >/dev/null 2>&1 || { echo "Not a PVE host?" >&2; exit 1; }
 
-tmp=$(mktemp)
-gui_js=$(mktemp)
-gui_sh=$(mktemp)
-trap 'rm -f "$tmp" "$gui_js" "$gui_sh"' EXIT
-echo "Local: download -> $TARGET"
-download_to "$tmp"
+if [[ "$GITHUB" -eq 1 ]]; then
+  tmp=$(mktemp)
+  gui_js=$(mktemp)
+  gui_sh=$(mktemp)
+  trap 'rm -f "$tmp" "$gui_js" "$gui_sh"' EXIT
+  echo "Local: download -> $TARGET"
+  download_to "$tmp"
+  download_to "$gui_js" "$GUI_JS_URL"
+  download_to "$gui_sh" "$GUI_INSTALLER_URL"
+else
+  tmp="$REPO_DIR/NimbleStoragePlugin.pm"
+  gui_js="$REPO_DIR/www/NimbleEdit.js"
+  gui_sh="$REPO_DIR/scripts/install-nimble-gui.sh"
+  for f in "$tmp" "$gui_js" "$gui_sh"; do
+    [[ -f "$f" ]] || { echo "Missing $f (run from a repo checkout, or use --github)" >&2; exit 1; }
+  done
+  echo "Local: repo copy $REPO_DIR -> $TARGET"
+fi
 install_from_tmp "$tmp"
-download_to "$gui_js" "$GUI_JS_URL"
-download_to "$gui_sh" "$GUI_INSTALLER_URL"
 # Installs NimbleEdit.js, injects the <script> tag into index.html.tpl, restarts pveproxy.
 bash "$gui_sh" --js "$gui_js"
 restart_stack

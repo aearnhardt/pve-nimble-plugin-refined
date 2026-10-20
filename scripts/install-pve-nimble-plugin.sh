@@ -84,6 +84,10 @@ Options:
   -a, --all-nodes               Install on all PVE cluster nodes via SSH
   -L, --local                   Install from the local repo copy this script lives in (no APT/GitHub)
       --local-dir DIR           Install from the local repo copy in DIR
+  -g, --github                  Install from GitHub (APT repo or release) even if a local copy exists
+
+Default source: the local repo copy when run from a checkout; GitHub only when you ask
+for it (--github, --version, or the menu) or when there is no local copy (curl | bash).
   -s, --status                  Show install status (plugin, GUI, services) and exit
   -u, --uninstall               Remove the plugin and GUI from this node
   -h, --help                    Show this help and exit
@@ -534,11 +538,12 @@ function show_menu()
 EOF
     read -r -p "Select an option: " choice < /dev/tty
     case "$choice" in
-        1) ;;
-        2) read -r -p "Release version (X.Y.Z): " INSTALL_VERSION < /dev/tty
+        1) SOURCE=remote ;;
+        2) SOURCE=remote
+           read -r -p "Release version (X.Y.Z): " INSTALL_VERSION < /dev/tty
            [[ -n "$INSTALL_VERSION" ]] || fail "No version given" ;;
         3) use_local ;;
-        4) ALL_NODES=1 ;;
+        4) SOURCE=remote; ALL_NODES=1 ;;
         5) ALL_NODES=1; use_local ;;
         6) ACTION=status ;;
         7) ACTION=uninstall ;;
@@ -610,7 +615,7 @@ function prepare()
     ALL_NODES=0
     DRY_RUN=0
     INSTALL_VERSION=""
-    SOURCE=remote
+    SOURCE=auto
     LOCAL_DIR=""
     ACTION=install
 
@@ -649,6 +654,10 @@ function prepare()
                 ;;
             -L|--local)
                 SOURCE=local
+                shift
+                ;;
+            -g|--github)
+                SOURCE=remote
                 shift
                 ;;
             --local-dir)
@@ -724,6 +733,13 @@ install_pve_plugin()
     [[ "$SOURCE" == local ]] && use_local
     if [[ "$argc" -eq 0 && -t 1 && -r /dev/tty ]]; then
         show_menu
+    fi
+    if [[ "$SOURCE" == auto ]]; then
+        if [[ -z "$INSTALL_VERSION" ]] && valid_local_dir "$(find_local_dir || true)"; then
+            use_local
+        else
+            SOURCE=remote
+        fi
     fi
     case "$ACTION" in
         status)
