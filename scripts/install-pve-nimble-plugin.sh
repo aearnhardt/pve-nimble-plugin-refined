@@ -34,6 +34,9 @@ readonly RESTARTED_SERVICES="pvedaemon pvestatd pveproxy pvescheduler"
 readonly PVE_MEMBERS_FILE=/etc/pve/.members
 readonly PACKAGE_NAME=libpve-storage-nimble-perl
 readonly REPO_BASE="${REPO_BASE:-https://brngates98.github.io/pve-nimble-plugin}"
+readonly PM_TARGET=/usr/share/perl5/PVE/Storage/Custom/NimbleStoragePlugin.pm
+readonly GUI_JS=/usr/share/pve-manager/js/NimbleEdit.js
+readonly GUI_TPL=/usr/share/pve-manager/index.html.tpl
 readonly GITHUB_RELEASES_BASE="${GITHUB_RELEASES_BASE:-https://github.com/brngates98/pve-nimble-plugin/releases/download}"
 
 REPO_SUITE="${REPO_SUITE:-bookworm}"
@@ -79,7 +82,13 @@ Options:
   -y, --yes                     Non-interactive mode; assume "yes" for confirmation
   -n, --dry-run                 Show what would be done; make no changes and skip prompts
   -a, --all-nodes               Install on all PVE cluster nodes via SSH
+  -L, --local                   Install from the local repo copy this script lives in (no APT/GitHub)
+      --local-dir DIR           Install from the local repo copy in DIR
+  -s, --status                  Show install status (plugin, GUI, services) and exit
+  -u, --uninstall               Remove the plugin and GUI from this node
   -h, --help                    Show this help and exit
+
+With no options on a terminal, an interactive menu is shown.
 
 Single node:
   curl -fsSL https://raw.githubusercontent.com/brngates98/pve-nimble-plugin/main/scripts/install-pve-nimble-plugin.sh | sudo bash
@@ -96,6 +105,17 @@ EOF
 function issue()
 {
     if [ -z "$REMOTE_NODE" ]; then
+        local g="" b="" r=""
+        [[ -t 1 ]] && { g=$'\e[32m'; b=$'\e[1m'; r=$'\e[0m'; }
+        # Green HPE element, then the wordmark: bold "Hewlett Packard", regular "Enterprise"
+        printf '%s' "$g"
+        cat <<'LOGO'
+
+  ████████████████████
+  ██                ██
+  ████████████████████
+LOGO
+        printf '%s\n  %sHewlett Packard%s\n  Enterprise\n\n' "$r" "$b" "$r"
         log "PVE Nimble Storage Plugin Installer $SCRIPT_VERSION"
         log ""
     fi
@@ -140,6 +160,28 @@ function preflight()
             *)       REPO_SUITE="bookworm" ;;
         esac
     fi
+}
+
+# Repo root this script is run from; empty when piped from curl (no file on disk)
+function find_local_dir()
+{
+    [[ -f "${BASH_SOURCE[0]:-}" ]] || return 1
+    (cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)
+}
+
+function valid_local_dir()
+{
+    local d="${1-}"
+    [[ -n "$d" && -f "$d/NimbleStoragePlugin.pm" && -f "$d/www/NimbleEdit.js" \
+        && -f "$d/scripts/install-nimble-gui.sh" ]]
+}
+
+# Switch to the local-copy source, resolving and validating LOCAL_DIR
+function use_local()
+{
+    SOURCE=local
+    [[ -n "$LOCAL_DIR" ]] || LOCAL_DIR=$(find_local_dir) || LOCAL_DIR=""
+    valid_local_dir "$LOCAL_DIR" || fail "No usable local copy (need NimbleStoragePlugin.pm, www/NimbleEdit.js, scripts/install-nimble-gui.sh). Run from a repo checkout or pass --local-dir DIR."
 }
 
 # quote input for remote execution
@@ -253,6 +295,10 @@ function install_on_all_nodes()
                 log "Installing on local node ($ip)..."
             fi
             install_software
+        elif [[ "$SOURCE" == local ]]; then
+            log ""
+            log "Installing local copy on remote node ($ip)..."
+            push_local_to_node "$ip"
         else
             local remote_cmd
             remote_cmd=$(printf '/usr/bin/curl -fsSL %s | bash -s -- -X %s %s' "$(installer_url)" "$ip" "${rflags[*]}")
@@ -303,7 +349,9 @@ function install_software()
         fi
     fi
 
-    if [[ -n "$INSTALL_VERSION" ]]; then
+    if [[ "$SOURCE" == local ]]; then
+        install_local
+    elif [[ -n "$INSTALL_VERSION" ]]; then
         install_from_github_deb
     else
         local mode
@@ -381,6 +429,124 @@ function install_from_apt_repo()
     builtin command systemctl try-reload-or-restart $RESTARTED_SERVICES
 }
 
+# Install the plugin + GUI straight from the local repo copy (no APT repo, no .deb).
+# Note: a later `apt upgrade` of the .deb package, if also installed, overwrites these files.
+function install_local()
+{
+    if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+        log "DRY-RUN: would install $LOCAL_DIR/NimbleStoragePlugin.pm -> $PM_TARGET"
+        log "DRY-RUN: would install $LOCAL_DIR/www/NimbleEdit.js -> $GUI_JS and add its tag to $GUI_TPL"
+        log "DRY-RUN: would restart PVE services: systemctl try-reload-or-restart $RESTARTED_SERVICES"
+        return
+    fi
+
+    head -n 1 "$LOCAL_DIR/NimbleStoragePlugin.pm" | grep -q '^package PVE::Storage::Custom::NimbleStoragePlugin' \
+        || fail "$LOCAL_DIR/NimbleStoragePlugin.pm does not look like the Nimble plugin"
+
+    log "1. Installing open-iscsi..."
+    builtin command apt-get install -y -q open-iscsi >> "$LOG_FILE" 2>&1
+
+    log "2. Installing plugin from $LOCAL_DIR..."
+    install -d -m 755 "$(dirname "$PM_TARGET")"
+    install -m 644 "$LOCAL_DIR/NimbleStoragePlugin.pm" "$PM_TARGET"
+
+    log "3. Installing GUI (NimbleEdit.js)..."
+    bash "$LOCAL_DIR/scripts/install-nimble-gui.sh" --js "$LOCAL_DIR/www/NimbleEdit.js" --no-restart >> "$LOG_FILE" 2>&1
+
+    log "4. Restarting PVE services ($RESTARTED_SERVICES)..."
+    builtin command systemctl try-reload-or-restart $RESTARTED_SERVICES
+}
+
+# Copy the local repo files to a remote node over SSH and install them there.
+function push_local_to_node()
+{
+    local ip="$1" tmp
+    local -a ssh_opts=( -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new )
+
+    if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+        log "DRY-RUN: would scp local copy to root@$ip and install it there"
+        return
+    fi
+
+    tmp=$(builtin command /usr/bin/ssh "${ssh_opts[@]}" "root@${ip}" mktemp -d) || fail "cannot ssh to root@$ip"
+    builtin command /usr/bin/scp "${ssh_opts[@]}" -q \
+        "$LOCAL_DIR/NimbleStoragePlugin.pm" "$LOCAL_DIR/www/NimbleEdit.js" \
+        "$LOCAL_DIR/scripts/install-nimble-gui.sh" "root@${ip}:${tmp}/" || fail "scp to root@$ip failed"
+    builtin command /usr/bin/ssh "${ssh_opts[@]}" "root@${ip}" "set -e
+        apt-get install -y -q open-iscsi >/dev/null
+        install -d -m 755 $(dirname "$PM_TARGET")
+        install -m 644 $tmp/NimbleStoragePlugin.pm $PM_TARGET
+        bash $tmp/install-nimble-gui.sh --js $tmp/NimbleEdit.js --no-restart
+        rm -rf $tmp
+        systemctl try-reload-or-restart $RESTARTED_SERVICES"
+}
+
+function show_status()
+{
+    local ver svc
+    ver=$(dpkg-query -W -f='${Version}' "$PACKAGE_NAME" 2>/dev/null || true)
+    log "Package : ${ver:-not installed (.deb)}"
+    log "Plugin  : $([ -f "$PM_TARGET" ] && echo "present ($PM_TARGET)" || echo MISSING)"
+    log "GUI JS  : $([ -f "$GUI_JS" ] && echo "present ($GUI_JS)" || echo MISSING)"
+    log "GUI tag : $(grep -qF NimbleEdit.js "$GUI_TPL" 2>/dev/null && echo "present in $GUI_TPL" || echo "MISSING from $GUI_TPL")"
+    for svc in $RESTARTED_SERVICES; do
+        log "Service : $svc $(systemctl is-active "$svc" 2>/dev/null || true)"
+    done
+}
+
+# Remove plugin + GUI from this node (works for both .deb and local-copy installs)
+function uninstall_plugin()
+{
+    if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+        log "DRY-RUN: would remove $PACKAGE_NAME, $PM_TARGET, $GUI_JS and its tag in $GUI_TPL"
+        return
+    fi
+    if [[ "${YES:-0}" -ne 1 && -t 0 ]]; then
+        read -r -p "Remove the Nimble plugin and GUI from this node? (y/n): " choice
+        [[ "$choice" == "y" ]] || { log "Aborted."; exit 1; }
+    fi
+    if dpkg-query -W -f='${Status}' "$PACKAGE_NAME" 2>/dev/null | grep -q "install ok installed"; then
+        builtin command apt-get remove -y -q "$PACKAGE_NAME" >> "$LOG_FILE" 2>&1
+    fi
+    rm -f "$PM_TARGET" "$GUI_JS" /etc/apt/apt.conf.d/99nimble-gui /usr/local/sbin/nimble-gui-install
+    [[ -f "$GUI_TPL" ]] && sed -i '/NimbleEdit\.js/d' "$GUI_TPL"
+    builtin command systemctl try-reload-or-restart $RESTARTED_SERVICES
+    log "Plugin and GUI removed. Storage entries in /etc/pve/storage.cfg were left untouched."
+}
+
+# Interactive menu: sets ACTION / SOURCE / ALL_NODES / INSTALL_VERSION, or exits
+function show_menu()
+{
+    local choice local_dir
+    local_dir=$(find_local_dir || true)
+    valid_local_dir "$local_dir" || local_dir=""
+
+    cat <<EOF
+----------------------------------------------------------
+  1) Install / upgrade from GitHub (APT repo)
+  2) Install a specific release from GitHub
+  3) Install from local copy   ${local_dir:-(not available: not run from a repo checkout)}
+  4) Install on ALL cluster nodes from GitHub
+  5) Install on ALL cluster nodes from local copy
+  6) Show status
+  7) Uninstall
+  0) Quit
+EOF
+    read -r -p "Select an option: " choice < /dev/tty
+    case "$choice" in
+        1) ;;
+        2) read -r -p "Release version (X.Y.Z): " INSTALL_VERSION < /dev/tty
+           [[ -n "$INSTALL_VERSION" ]] || fail "No version given" ;;
+        3) use_local ;;
+        4) ALL_NODES=1 ;;
+        5) ALL_NODES=1; use_local ;;
+        6) ACTION=status ;;
+        7) ACTION=uninstall ;;
+        0) exit 0 ;;
+        *) fail "Invalid choice: $choice" ;;
+    esac
+}
+
 function install_from_github_deb()
 {
     local ver="$INSTALL_VERSION"
@@ -426,6 +592,10 @@ function post_install()
         if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
             log "PVE Nimble Storage Plugin dry run complete. No changes were made."
         else
+            if [ ! -f "$GUI_JS" ] || ! grep -qF NimbleEdit.js "$GUI_TPL" 2>/dev/null; then
+                log "WARNING: GUI not fully installed (NimbleEdit.js or its tag in $GUI_TPL is missing)."
+                log "         Run scripts/install-nimble-gui.sh on this node, then hard-refresh the browser."
+            fi
             log "PVE Nimble Storage Plugin installation complete."
         fi
     fi
@@ -440,6 +610,9 @@ function prepare()
     ALL_NODES=0
     DRY_RUN=0
     INSTALL_VERSION=""
+    SOURCE=remote
+    LOCAL_DIR=""
+    ACTION=install
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -472,6 +645,26 @@ function prepare()
                 ;;
             -n|--dry-run)
                 DRY_RUN=1
+                shift
+                ;;
+            -L|--local)
+                SOURCE=local
+                shift
+                ;;
+            --local-dir)
+                if [[ -z "${2-}" ]]; then
+                    fail "Option $1 requires an argument"
+                fi
+                SOURCE=local
+                LOCAL_DIR="$2"
+                shift 2
+                ;;
+            -s|--status)
+                ACTION=status
+                shift
+                ;;
+            -u|--uninstall)
+                ACTION=uninstall
                 shift
                 ;;
             -h|--help)
@@ -524,9 +717,24 @@ function prepare()
 ##########################################################
 install_pve_plugin()
 {
+    local argc=$#
     prepare "$@"
     issue
     preflight
+    [[ "$SOURCE" == local ]] && use_local
+    if [[ "$argc" -eq 0 && -t 1 && -r /dev/tty ]]; then
+        show_menu
+    fi
+    case "$ACTION" in
+        status)
+            show_status
+            return
+            ;;
+        uninstall)
+            uninstall_plugin
+            return
+            ;;
+    esac
     if [[ "${ALL_NODES:-0}" -eq 1 ]]; then
         install_on_all_nodes
     else

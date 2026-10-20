@@ -8,7 +8,10 @@ set -euo pipefail
 
 readonly TARGET='/usr/share/perl5/PVE/Storage/Custom/NimbleStoragePlugin.pm'
 readonly DEFAULT_URL='https://raw.githubusercontent.com/brngates98/pve-nimble-plugin/main/NimbleStoragePlugin.pm'
+readonly DEFAULT_BASE='https://raw.githubusercontent.com/brngates98/pve-nimble-plugin/main'
 PLUGIN_URL="${PLUGIN_URL:-$DEFAULT_URL}"
+GUI_JS_URL="${GUI_JS_URL:-$DEFAULT_BASE/www/NimbleEdit.js}"
+GUI_INSTALLER_URL="${GUI_INSTALLER_URL:-$DEFAULT_BASE/scripts/install-nimble-gui.sh}"
 REMOTES="${REMOTES:-pve001 pve003}"
 THIS="$(hostname -s 2>/dev/null || hostname)"
 
@@ -25,11 +28,11 @@ restart_stack() {
 }
 
 download_to() {
-  local out="$1"
+  local out="$1" url="${2:-$PLUGIN_URL}"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 20 --max-time 120 -o "$out" -- "$PLUGIN_URL"
+    curl -fsSL --connect-timeout 20 --max-time 120 -o "$out" -- "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=120 -O "$out" -- "$PLUGIN_URL"
+    wget -q --timeout=120 -O "$out" -- "$url"
   else
     echo "Need curl or wget" >&2
     exit 1
@@ -50,10 +53,16 @@ install_from_tmp() {
 command -v pveversion >/dev/null 2>&1 || { echo "Not a PVE host?" >&2; exit 1; }
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+gui_js=$(mktemp)
+gui_sh=$(mktemp)
+trap 'rm -f "$tmp" "$gui_js" "$gui_sh"' EXIT
 echo "Local: download -> $TARGET"
 download_to "$tmp"
 install_from_tmp "$tmp"
+download_to "$gui_js" "$GUI_JS_URL"
+download_to "$gui_sh" "$GUI_INSTALLER_URL"
+# Installs NimbleEdit.js, injects the <script> tag into index.html.tpl, restarts pveproxy.
+bash "$gui_sh" --js "$gui_js"
 restart_stack
 echo "Local: done."
 
@@ -70,12 +79,16 @@ for h in $REMOTES; do
     echo "ERROR: scp to root@${h} failed (keys? DNS? firewall?)" >&2
     exit 1
   }
+  scp "${SSH_OPTS[@]}" "$gui_js" "root@${h}:/tmp/NimbleEdit.js" || exit 1
+  scp "${SSH_OPTS[@]}" "$gui_sh" "root@${h}:/tmp/install-nimble-gui.sh" || exit 1
   ssh "${SSH_OPTS[@]}" "root@${h}" bash -s <<'REMOTE'
 set -euo pipefail
 T='/usr/share/perl5/PVE/Storage/Custom/NimbleStoragePlugin.pm'
 install -d -m 755 "$(dirname "$T")"
 install -m 644 /tmp/NimbleStoragePlugin.new "$T"
 rm -f /tmp/NimbleStoragePlugin.new
+bash /tmp/install-nimble-gui.sh --js /tmp/NimbleEdit.js
+rm -f /tmp/NimbleEdit.js /tmp/install-nimble-gui.sh
 if command -v deb-systemd-invoke >/dev/null 2>&1; then
   for s in pvedaemon pvestatd pveproxy pvescheduler; do
     deb-systemd-invoke try-restart "${s}.service" 2>/dev/null || true
